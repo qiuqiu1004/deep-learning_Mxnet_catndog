@@ -1,0 +1,209 @@
+
+Python ~/mxnet/tools/im2rec.py －－list True －－recursive True －－train-ratio 0.9 myData /Users/caishuyi/Desktop/cat_dog/training
+#生成训练数据集和验证数据集
+python ~/mxnet/tools/im2rec.py –num-thread 4 –pass-through 1 myData /Users/caishuyi/Desktop/cat_dog/training
+#生成rec文件格式数据，之后加载中使用（my_images_train.rec，my_images_val.rec）
+#2 自己的数据训练的模型（使用数据集）
+import mxnet as mx
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import numpy as np
+# define a simple data batch
+from collections import namedtuple
+
+def residual_unit(data, num_filter, stride, dim_match, name, bottle_neck=True, bn_mom=0.9, workspace=256, memonger=False):
+
+    if bottle_neck:
+
+        bn1 = mx.symbol.BatchNorm(data=data, fix_gamma=False, eps=2e-5, momentum=bn_mom, name=name + '_bn1')
+        act1 = mx.symbol.Activation(data=bn1, act_type='relu', name=name + '_relu1')
+        weight = mx.symbol.Variable(name=name + '_conv1_weight', dtype=np.float32)
+        weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+        conv1 = mx.symbol.Convolution(data=act1, weight=weight, num_filter=int(num_filter*0.25), kernel=(7,7), stride=(1,1), pad=(0,0),
+                                   no_bias=True, workspace=workspace, name=name + '_conv1')
+        bn2 = mx.symbol.BatchNorm(data=conv1, fix_gamma=False, eps=2e-5, momentum=bn_mom, name=name + '_bn2')
+        act2 = mx.symbol.Activation(data=bn2, act_type='relu', name=name + '_relu2')
+        weight = mx.symbol.Variable(name=name + '_conv2_weight', dtype=np.float32)
+        weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+        conv2 = mx.symbol.Convolution(data=act2, weight=weight, num_filter=int(num_filter*0.25), kernel=(3,3), stride=stride, pad=(1,1),
+                                   no_bias=True, workspace=workspace, name=name + '_conv2')
+        bn3 = mx.symbol.BatchNorm(data=conv2, fix_gamma=False, eps=2e-5, momentum=bn_mom, name=name + '_bn3')
+        act3 = mx.symbol.Activation(data=bn3, act_type='relu', name=name + '_relu3')
+        weight = mx.symbol.Variable(name=name + '_conv3_weight', dtype=np.float32)
+        weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+        conv3 = mx.symbol.Convolution(data=act3, weight=weight, num_filter=num_filter, kernel=(1,1), stride=(1,1), pad=(0,0), no_bias=True,
+                                   workspace=workspace, name=name + '_conv3')
+        if dim_match:
+            shortcut = data
+        else:
+            weight = mx.symbol.Variable(name=name + '_sc_weight', dtype=np.float32)
+            weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+            shortcut = mx.sym.Convolution(data=act1, weight=weight, num_filter=num_filter, kernel=(1,1), stride=stride, no_bias=True,
+                                            workspace=workspace, name=name+'_sc')
+        if memonger:
+            shortcut._set_attr(mirror_stage='True')
+        return conv3 + shortcut
+    else:
+        bn1 = mx.symbol.BatchNorm(data=data, fix_gamma=False, momentum=bn_mom, eps=2e-5, name=name + '_bn1')
+        act1 = mx.symbol.Activation(data=bn1, act_type='relu', name=name + '_relu1')
+        weight = mx.symbol.Variable(name=name + '_conv1_weight', dtype=np.float32)
+        weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+        conv1 = mx.symbol.Convolution(data=act1, weight=weight, num_filter=num_filter, kernel=(3,3), stride=stride, pad=(1,1),
+                                      no_bias=True, workspace=workspace, name=name + '_conv1')
+        bn2 = mx.symbol.BatchNorm(data=conv1, fix_gamma=False, momentum=bn_mom, eps=2e-5, name=name + '_bn2')
+        act2 = mx.symbol.Activation(data=bn2, act_type='relu', name=name + '_relu2')
+        weight = mx.symbol.Variable(name=name + '_conv2_weight', dtype=np.float32)
+        weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+        conv2 = mx.symbol.Convolution(data=act2, weight=weight, num_filter=num_filter, kernel=(3,3), stride=(1,1), pad=(1,1),
+                                      no_bias=True, workspace=workspace, name=name + '_conv2')
+        if dim_match:
+            shortcut = data
+        else:
+            weight = mx.symbol.Variable(name=name + '_sc_weight', dtype=np.float32)
+            weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+            shortcut = mx.symbol.Convolution(data=act1, weight=weight, num_filter=num_filter, kernel=(1,1), stride=stride, no_bias=True,
+                                            workspace=workspace, name=name+'_sc')
+        if memonger:
+            shortcut._set_attr(mirror_stage='True')
+        return conv2 + shortcut
+
+def resnet(units, num_stages, filter_list, num_classes, image_shape, bottle_neck=True, bn_mom=0.9, workspace=256, memonger=False):
+    num_unit = len(units)
+    assert(num_unit == num_stages)
+    data = mx.symbol.Variable(name='data')
+    data = mx.symbol.Cast(data=data, dtype=np.float16)
+    data = mx.symbol.BatchNorm(data=data, fix_gamma=True, eps=2e-5, momentum=bn_mom, name='bn_data')
+    (nchannel, height, width) = image_shape
+    weight = mx.symbol.Variable(name='conv0_weight', dtype=np.float32)
+    weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+
+    body = mx.sym.Convolution(data=data, weight=weight, num_filter=filter_list[0], kernel=(7, 7), stride=(2,2), pad=(3, 3),
+                                  no_bias=True, name="conv0", workspace=workspace)
+    body = mx.sym.BatchNorm(data=body, fix_gamma=False, eps=2e-5, momentum=bn_mom, name='bn0')
+    body = mx.sym.Activation(data=body, act_type='relu', name='relu0')
+    body = mx.symbol.Pooling(data=body, kernel=(3, 3), stride=(2,2), pad=(1,1), pool_type='max')
+
+    for i in range(num_stages):
+        body = residual_unit(body, filter_list[i+1], (1 if i==0 else 2, 1 if i==0 else 2), False,
+                             name='stage%d_unit%d' % (i + 1, 1), bottle_neck=bottle_neck, workspace=workspace,
+                             memonger=memonger)
+        for j in range(units[i]-1):
+            body = residual_unit(body, filter_list[i+1], (1,1), True, name='stage%d_unit%d' % (i + 1, j + 2),
+                                 bottle_neck=bottle_neck, workspace=workspace, memonger=memonger)
+    bn1 = mx.symbol.BatchNorm(data=body, fix_gamma=False, eps=2e-5, momentum=bn_mom, name='bn1')
+    relu1 = mx.symbol.Activation(data=bn1, act_type='relu', name='relu1')
+    # Although kernel is not used here when global_pool=True, we should put one
+    pool1 = mx.symbol.Pooling(data=relu1, global_pool=True, kernel=(7, 7), pool_type='avg', name='pool1')
+    flat = mx.symbol.Flatten(data=pool1)
+    weight = mx.symbol.Variable(name='fc1_weight', dtype=np.float32)
+    bias = mx.symbol.Variable(name='fc1_bias', dtype=np.float32)
+    weight = mx.symbol.Cast(data=weight, dtype=np.float16)
+    bias = mx.symbol.Cast(data=bias, dtype=np.float16)
+    fc1 = mx.symbol.FullyConnected(data=flat, weight=weight, bias=bias, num_hidden=num_classes, name='fc1')
+    fc1 = mx.symbol.Cast(data=fc1, dtype=np.float32)
+    return mx.symbol.SoftmaxOutput(data=fc1, name='softmax')
+
+def get_symbol(num_classes, num_layers, image_shape, conv_workspace=256, **kwargs):
+    image_shape = [3，224，224]
+    (nchannel, height, width) = image_shape
+    if height <= 28:
+        num_stages = 3
+        if (num_layers-2) % 9 == 0 and num_layers >= 164:
+            per_unit = [(num_layers-2)//9]
+            filter_list = [16, 64, 128, 256]
+            bottle_neck = True
+        elif (num_layers-2) % 6 == 0 and num_layers < 164:
+            per_unit = [(num_layers-2)//6]
+            filter_list = [16, 16, 32, 64]
+            bottle_neck = False
+        else:
+            raise ValueError("no experiments done on num_layers {}, you can do it youself".format(num_layers))
+        units = per_unit * num_stages
+    else:
+        filter_list = [64, 64, 128, 256, 512]
+        bottle_neck = False
+        num_stages = 4
+        units = [2, 2, 2, 2]
+
+
+    return resnet(units       = units,
+                  num_stages  = num_stages,
+                  filter_list = filter_list,
+                  num_classes = num_classes,
+                  image_shape = image_shape,
+                  bottle_neck = bottle_neck,
+                  workspace   = conv_workspace)
+
+resnet18=get_symbol(2,18,'3,224,224')
+
+##
+def get_iterators(batch_size, data_shape=(3, 224, 224)):
+    train = mx.io.ImageRecordIter(
+    ##之前生成的训练数据rec类型
+        path_imgrec         = '/Users/caishuyi/Desktop/cat_dog/training/my_images_train.rec',
+        data_name           = 'data',
+        label_name          = 'softmax_label',
+        batch_size          = batch_size,
+        data_shape          = data_shape,
+        shuffle             = True,
+        rand_crop           = True,
+        rand_mirror         = True)
+    val = mx.io.ImageRecordIter(
+      ##之前生成的训练数据rec类型
+        path_imgrec         = '/Users/caishuyi/Desktop/cat_dog/training/my_images_val.rec',
+        data_name           = 'data',
+        label_name          = 'softmax_label',
+        batch_size          = batch_size,
+        data_shape          = data_shape,
+        rand_crop           = False,
+        rand_mirror         = False)
+    return (train, val)
+ train,val=get_iterators(10,(3,224,224))
+###
+
+####用自己的数据训练出模型（参数）
+model_prefix = 'resnet18'
+checkpoint = mx.callback.do_checkpoint(model_prefix)
+
+mod = mx.mod.Module(symbol=resnet,context=mx.cpu())
+mod.fit(train,
+        eval_data=val,
+        optimizer='sgd',
+        optimizer_params={'learning_rate':0.01, 'momentum': 0.9},
+        eval_metric='acc',
+        num_epoch=30,
+        epoch_end_callback=checkpoint)
+
+sym, arg_params, aux_params = mx.model.load_checkpoint('resnet18', 30)
+mod = mx.mod.Module(symbol=sym, context=mx.cpu(), label_names=None)
+        mod.bind(for_training=False, data_shapes=[('data', (1,3,224,224))],
+                 label_shapes=mod._label_shapes)
+        mod.set_params(arg_params, aux_params, allow_missing=True)
+####
+# 测试训练得到的模型结果
+def get_image(fnamepath, show=False):
+            # show the image
+            img = cv2.cvtColor(cv2.imread(fnamepath), cv2.COLOR_BGR2RGB)
+            if img is None:
+               return None
+            # convert into format (batch, RGB, width, height)
+            img = cv2.resize(img, (224, 224))
+            img = np.swapaxes(img, 0, 2)
+            img = np.swapaxes(img, 1, 2)
+            Batch = namedtuple('Batch', ['data'])
+            img = img[np.newaxis, :]
+            return img
+
+        def predict(fnamepath):
+            img = get_image(fnamepath, show=True)
+            # compute the predict probabilities
+            mod.forward(Batch([mx.nd.array(img)]))
+            prob = mod.get_outputs()[0].asnumpy()
+            # print the top-1
+            prob = np.squeeze(prob)
+            a = np.argsort(prob)[::-1]
+            for i in a[0]:
+                print('probability=%f, class=%s' %(prob[i], labels[i]))
+
+predict(/Users/caishuyi/Desktop/cat_dog/testing/0001.jpg)##用于测试的图片路径。
